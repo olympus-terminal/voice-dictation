@@ -1,15 +1,17 @@
 # Voice-to-Text GPU
 
-GPU-accelerated voice dictation using OpenAI Whisper. Real-time speech-to-text that can either print to terminal or type directly into any focused window.
+GPU-accelerated real-time voice dictation using [faster-whisper](https://github.com/SYSTRAN/faster-whisper) and [Silero VAD](https://github.com/snakers4/silero-vad).
 
 ## Features
 
-- GPU-accelerated transcription using CUDA
-- Two modes: terminal output or direct window typing (via xdotool)
-- Voice commands for punctuation and actions
-- Hallucination filtering (blocks common Whisper artifacts like "Thanks for watching")
-- Repetition loop detection
-- Configurable silence threshold and model size
+- **faster-whisper** (CTranslate2 backend) -- ~4x faster than openai-whisper, lower VRAM
+- **Silero VAD** -- neural voice activity detection eliminates hallucinations on silence
+- **Threaded pipeline** -- records audio while previous utterance is being transcribed
+- **Push-to-talk** -- optional hold-to-record mode (Right Ctrl)
+- **Window typing** -- types directly into any focused window via xdotool
+- **Voice commands** -- punctuation and actions via spoken phrases
+- **Microphone selection** -- choose input device from the command line
+- Hallucination filtering and repetition loop detection
 
 ## Requirements
 
@@ -17,7 +19,7 @@ GPU-accelerated voice dictation using OpenAI Whisper. Real-time speech-to-text t
 - Python 3.8+
 - ffmpeg
 - xdotool (for window typing mode)
-- PulseAudio/PipeWire
+- PulseAudio or PipeWire
 
 ## Installation
 
@@ -30,97 +32,151 @@ conda activate dictation
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
 # Install dependencies
-pip install openai-whisper pyaudio numpy
+pip install faster-whisper silero-vad pyaudio numpy pynput
 
-# Install system dependencies (Ubuntu/Debian)
+# System dependencies (Ubuntu/Debian)
 sudo apt install ffmpeg xdotool portaudio19-dev
 ```
 
 ## Usage
 
 ### Terminal Mode
-Prints transcribed text to the terminal:
+
+Prints transcribed text to the terminal (no xdotool needed):
 
 ```bash
-python dictate_terminal.py [--model small] [--chunk 5]
+python dictate_terminal.py
+python dictate_terminal.py --model small         # faster, less accurate
+python dictate_terminal.py --list-devices        # show microphones
+python dictate_terminal.py --device 1            # pick a mic
 ```
 
 ### Window Typing Mode
+
 Types directly into the focused window:
 
 ```bash
 python dictate_to_window.py
+python dictate_to_window.py --push-to-talk       # hold Right Ctrl to record
+python dictate_to_window.py --model large-v3     # most accurate (default)
+python dictate_to_window.py --no-type            # print only, don't type
+python dictate_to_window.py --list-devices
+python dictate_to_window.py --device 1
 ```
 
 1. Run the script in a terminal
-2. Click on the window you want to type into (e.g., your editor, chat app)
-3. Speak - text appears in the focused window
-4. Use voice commands for punctuation and actions
+2. Click on the window you want to type into
+3. Speak naturally -- pauses end an utterance
+4. Text appears in the focused window
+
+### Push-to-Talk
+
+```bash
+python dictate_to_window.py --push-to-talk
+```
+
+Hold **Right Ctrl** to record. Release to stop. Only speech recorded while the key is held will be transcribed.
 
 ## Voice Commands
+
+Punctuation requires the `insert` prefix so normal speech isn't mangled:
 
 | Command | Action |
 |---------|--------|
 | `send message` / `send it` / `press enter` | Press Enter |
 | `new line` | Insert newline |
-| `insert period` | Insert `.` |
-| `insert comma` | Insert `,` |
-| `insert question mark` | Insert `?` |
-| `insert exclamation` | Insert `!` |
-| `insert colon` | Insert `:` |
-| `insert semicolon` | Insert `;` |
+| `insert period` | `.` |
+| `insert comma` | `,` |
+| `insert question mark` | `?` |
+| `insert exclamation` | `!` |
+| `insert colon` | `:` |
+| `insert semicolon` | `;` |
 | `delete that` / `delete word` | Delete previous word |
 
-## Configuration
+## Models
 
-Edit the config section at the top of the scripts:
+faster-whisper uses CTranslate2-converted models. Available sizes:
 
-```python
-SAMPLE_RATE = 16000
-CHUNK_DURATION = 4  # seconds per recording chunk
-MODEL_SIZE = "large"  # tiny, base, small, medium, large
+| Model | VRAM | Speed | Accuracy | Notes |
+|-------|------|-------|----------|-------|
+| `tiny` | ~1 GB | Fastest | Basic | Good for testing |
+| `base` | ~1 GB | Very fast | Fair | |
+| `small` | ~2 GB | Fast | Good | Decent for most uses |
+| `medium` | ~4 GB | Medium | Very good | |
+| `large-v2` | ~5 GB | Slower | Excellent | |
+| `large-v3` | ~5 GB | Slower | Best | Default, recommended |
+
+All models are downloaded automatically on first use from Hugging Face.
+
+## Architecture
+
+```
+Microphone
+    |
+    v
+[Silero VAD] -- detects speech start/end
+    |
+    v
+[Audio Buffer] -- accumulates frames until pause detected
+    |
+    v
+[Queue] -------> [Transcription Thread]
+                       |
+                       v
+                  [faster-whisper GPU]
+                       |
+                       v
+                  [Hallucination Filter]
+                       |
+                       v
+                  [Voice Commands]
+                       |
+                       v
+                  [xdotool] --> Focused Window
 ```
 
-### Model Sizes
-
-| Model | VRAM | Speed | Accuracy |
-|-------|------|-------|----------|
-| tiny | ~1GB | Fastest | Basic |
-| base | ~1GB | Fast | Fair |
-| small | ~2GB | Fast | Good |
-| medium | ~5GB | Medium | Better |
-| large | ~10GB | Slower | Best |
-
-### Silence Threshold
-
-If you're getting too many hallucinations from background noise, increase the threshold:
-
-```python
-def is_silent(audio, threshold=0.08):  # increase this value
-```
+The threaded pipeline means recording continues while the previous utterance is being transcribed, so you never miss speech.
 
 ## Troubleshooting
 
-### "Thanks for watching" / hallucinations
-- Increase the silence threshold
-- Use a better microphone (avoid Bluetooth - compression causes issues)
-- Switch to a larger model
+### Hallucinations ("Thanks for watching", etc.)
 
-### Repetition loops ("a little bit of a little bit of...")
-- Built-in detection should skip these
-- Usually caused by unclear audio or background noise
+With Silero VAD this should be rare. If it still happens:
+- Use a better microphone (wired > Bluetooth)
+- Bluetooth mics use lossy compression that confuses Whisper
+- The hallucination filter catches common phrases automatically
+
+### Repetition loops
+
+Set automatically by `condition_on_previous_text=False` in faster-whisper. The post-processing filter also catches remaining loops.
 
 ### X server crash / display manager restart
-- If using `dictate_to_window.py`, xdotool can sometimes cause issues
-- Increase xdotool delay in the script if needed
-- Consider using on Wayland with ydotool instead
 
-### JACK errors
+If `dictate_to_window.py` causes X issues:
+- The script uses `--clearmodifiers` and a 12ms delay to be safer
+- Consider using `--push-to-talk` mode to control when typing happens
+- On Wayland, xdotool won't work; use ydotool instead
+
+### JACK warnings
+
 ```
 Cannot connect to server socket err = No such file or directory
 jack server is not running or cannot be started
 ```
-These are harmless warnings and can be ignored.
+
+Harmless -- PyAudio prints these when JACK isn't installed. They can be safely ignored.
+
+### Choosing a microphone
+
+```bash
+python dictate_to_window.py --list-devices
+```
+
+Then pass the device number:
+
+```bash
+python dictate_to_window.py --device 3
+```
 
 ## License
 

@@ -1,31 +1,49 @@
 #!/usr/bin/env python3
 """
-GPU-accelerated voice dictation using Whisper that types into focused window.
+GPU-accelerated voice dictation using faster-whisper + Silero VAD.
+Types transcribed speech directly into the focused window.
+
+Features:
+  - faster-whisper (CTranslate2) for ~4x speedup over openai-whisper
+  - Silero VAD for accurate speech detection (eliminates hallucinations)
+  - Threaded pipeline: records while transcribing
+  - Push-to-talk mode (hold Right Ctrl) or always-on mode
+  - Microphone selection
 
 Usage:
-  1. Run this in a separate terminal
-  2. Click on your Claude Code window
-  3. Speak - text appears in Claude Code after each chunk
-  4. Say "send message" to press Enter
+  python dictate_to_window.py                    # always-on, default mic
+  python dictate_to_window.py --push-to-talk     # hold Right Ctrl to record
+  python dictate_to_window.py --model large-v3   # use specific model
+  python dictate_to_window.py --list-devices      # show available mics
+  python dictate_to_window.py --device 1          # use specific mic
 
 Ctrl+C to stop.
 """
 
-import whisper
-import pyaudio
-import numpy as np
-import tempfile
-import wave
-import subprocess
+import argparse
+import sys
 import os
 import re
+import subprocess
+import threading
+import queue
+import time
+import numpy as np
+import pyaudio
 
-# Config
+# ---------------------------------------------------------------------------
+# Configuration defaults
+# ---------------------------------------------------------------------------
 SAMPLE_RATE = 16000
-CHUNK_DURATION = 4  # seconds - shorter for faster response
-MODEL_SIZE = "large"  # most accurate, uses ~3GB VRAM
+FRAME_SIZE = 512           # samples per VAD frame (32ms at 16kHz)
+SPEECH_PAD_MS = 300        # padding around detected speech (ms)
+MIN_SPEECH_MS = 250        # minimum speech duration to transcribe
+MAX_SPEECH_S = 15          # maximum single utterance length (seconds)
+SILENCE_AFTER_SPEECH_MS = 600  # silence duration to end an utterance
 
-# Voice commands - punctuation requires "insert" prefix to avoid mangling normal speech
+# ---------------------------------------------------------------------------
+# Voice commands — punctuation requires "insert" prefix
+# ---------------------------------------------------------------------------
 COMMANDS = {
     'send message': 'ENTER',
     'send it': 'ENTER',
@@ -42,20 +60,32 @@ COMMANDS = {
     'delete word': 'DELETE',
 }
 
+# Whisper hallucination phrases (produced on silence / noise)
+HALLUCINATIONS = {
+    '', 'you', 'the', 'a', 'i', 'it', 'bye', 'okay', 'ok', 'yeah', 'yes',
+    'no', 'thanks', 'thank you', 'thanks for watching', 'thank you for watching',
+    'like and subscribe', 'subscribe', 'see you next time', 'bye bye',
+    'see you in the next video', 'yes sir', 'so',
+}
+
+# ---------------------------------------------------------------------------
+# Input helpers (xdotool)
+# ---------------------------------------------------------------------------
 def type_text(text):
-    """Type text into focused window."""
+    """Type text into the focused window."""
     if text:
-        subprocess.run(['xdotool', 'type', '--delay', '5', text], check=False)
+        subprocess.run(['xdotool', 'type', '--clearmodifiers', '--delay', '12', text],
+                       check=False)
 
 def press_key(key):
-    """Press a key."""
-    subprocess.run(['xdotool', 'key', key], check=False)
+    """Press a key in the focused window."""
+    subprocess.run(['xdotool', 'key', '--clearmodifiers', key], check=False)
 
 def process_commands(text):
-    """Process voice commands in text."""
+    """Check for voice commands and execute them. Returns text to type or None."""
     text_lower = text.lower().strip()
 
-    # Check for exact command
+    # Exact match
     if text_lower in COMMANDS:
         cmd = COMMANDS[text_lower]
         if cmd == 'ENTER':
@@ -67,137 +97,299 @@ def process_commands(text):
         else:
             return cmd
 
-    # Replace command phrases within text
+    # Command at end of utterance
     for phrase, replacement in COMMANDS.items():
         if phrase in text_lower:
             if replacement in ('ENTER', 'DELETE'):
-                # Handle these specially at end
                 if text_lower.endswith(phrase):
-                    text = text_lower.replace(phrase, '').strip()
-                    if text:
-                        type_text(text + ' ')
+                    remaining = text_lower.replace(phrase, '').strip()
+                    if remaining:
+                        type_text(remaining + ' ')
                     if replacement == 'ENTER':
                         press_key('Return')
+                    elif replacement == 'DELETE':
+                        press_key('ctrl+BackSpace')
                     return None
             else:
                 text = re.sub(re.escape(phrase), replacement, text, flags=re.IGNORECASE)
 
     return text
 
-def record_chunk(stream, duration):
-    """Record audio chunk."""
-    frames = []
-    for _ in range(int(SAMPLE_RATE * duration / 1024)):
-        data = stream.read(1024, exception_on_overflow=False)
-        frames.append(data)
-    audio = np.frombuffer(b''.join(frames), dtype=np.int16).astype(np.float32) / 32768.0
-    return audio
+# ---------------------------------------------------------------------------
+# Hallucination / repetition filters
+# ---------------------------------------------------------------------------
+def is_hallucination(text):
+    """Return True if text looks like a Whisper hallucination."""
+    clean = text.lower().strip().strip('.!,?')
+    if clean in HALLUCINATIONS:
+        return True
+    # "for watching" anywhere
+    if 'for watching' in clean or 'subscribe' in clean:
+        return True
+    # All-bye variants
+    if clean.replace('bye', '').replace(' ', '').replace('for', '').replace('now', '') == '':
+        return True
+    return False
 
-def is_silent(audio, threshold=0.08):
-    """Check if audio is mostly silence. Higher threshold = less false triggers."""
-    return np.max(np.abs(audio)) < threshold
+def has_repetition(text):
+    """Return True if text contains a looping phrase."""
+    words = text.lower().split()
+    if len(words) < 6:
+        return False
+    for plen in range(2, 5):
+        if len(words) >= plen * 3:
+            pattern = ' '.join(words[:plen])
+            if text.lower().count(pattern) >= 3:
+                return True
+    return False
 
-def save_wav(audio, path):
-    """Save audio to WAV."""
-    with wave.open(path, 'wb') as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(SAMPLE_RATE)
-        wf.writeframes((audio * 32768).astype(np.int16).tobytes())
+# ---------------------------------------------------------------------------
+# Audio device listing
+# ---------------------------------------------------------------------------
+def list_devices():
+    """Print available input devices."""
+    p = pyaudio.PyAudio()
+    print("\nAvailable input devices:")
+    print("-" * 50)
+    for i in range(p.get_device_count()):
+        info = p.get_device_info_by_index(i)
+        if info['maxInputChannels'] > 0:
+            default = " (DEFAULT)" if i == p.get_default_input_device_info()['index'] else ""
+            print(f"  {i}: {info['name']}{default}")
+    print()
+    p.terminate()
 
+# ---------------------------------------------------------------------------
+# VAD-based audio recorder
+# ---------------------------------------------------------------------------
+class VoiceRecorder:
+    """Records audio and yields speech segments using Silero VAD."""
+
+    def __init__(self, device_index=None, push_to_talk=False):
+        from silero_vad import load_silero_vad
+        import torch
+
+        self.vad_model = load_silero_vad()
+        self.torch = torch
+        self.device_index = device_index
+        self.push_to_talk = push_to_talk
+        self._ptt_active = not push_to_talk  # if no PTT, always active
+        self._running = True
+
+        # Audio setup
+        self.pa = pyaudio.PyAudio()
+        kwargs = dict(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=SAMPLE_RATE,
+            input=True,
+            frames_per_buffer=FRAME_SIZE,
+        )
+        if device_index is not None:
+            kwargs['input_device_index'] = device_index
+        self.stream = self.pa.open(**kwargs)
+
+        # If push-to-talk, start keyboard listener
+        if push_to_talk:
+            self._start_ptt_listener()
+
+    def _start_ptt_listener(self):
+        """Listen for Right Ctrl key for push-to-talk."""
+        from pynput import keyboard
+
+        def on_press(key):
+            if key == keyboard.Key.ctrl_r:
+                self._ptt_active = True
+
+        def on_release(key):
+            if key == keyboard.Key.ctrl_r:
+                self._ptt_active = False
+
+        self._kb_listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+        self._kb_listener.daemon = True
+        self._kb_listener.start()
+
+    def _read_frame(self):
+        """Read one VAD frame from the mic. Returns float32 numpy array."""
+        data = self.stream.read(FRAME_SIZE, exception_on_overflow=False)
+        return np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+
+    def _vad_is_speech(self, frame):
+        """Run Silero VAD on a single frame. Returns True if speech detected."""
+        tensor = self.torch.from_numpy(frame)
+        confidence = self.vad_model(tensor, SAMPLE_RATE).item()
+        return confidence > 0.5
+
+    def iter_utterances(self):
+        """Yield numpy arrays of complete speech utterances."""
+        frames_per_ms = SAMPLE_RATE / 1000
+        silence_frames_needed = int(SILENCE_AFTER_SPEECH_MS / (FRAME_SIZE / SAMPLE_RATE * 1000))
+        min_speech_frames = int(MIN_SPEECH_MS / (FRAME_SIZE / SAMPLE_RATE * 1000))
+        max_speech_frames = int(MAX_SPEECH_S * SAMPLE_RATE / FRAME_SIZE)
+
+        while self._running:
+            # Wait for speech to start
+            frame = self._read_frame()
+
+            if not self._ptt_active:
+                continue
+
+            if not self._vad_is_speech(frame):
+                continue
+
+            # Speech detected — accumulate frames
+            speech_frames = [frame]
+            silence_count = 0
+
+            while self._running and silence_count < silence_frames_needed:
+                frame = self._read_frame()
+                speech_frames.append(frame)
+
+                if self._vad_is_speech(frame):
+                    silence_count = 0
+                else:
+                    silence_count += 1
+
+                # Safety: cap utterance length
+                if len(speech_frames) >= max_speech_frames:
+                    break
+
+            # Check minimum length
+            if len(speech_frames) < min_speech_frames:
+                continue
+
+            # Concatenate and yield
+            audio = np.concatenate(speech_frames)
+
+            # Reset VAD state between utterances
+            self.vad_model.reset_states()
+
+            yield audio
+
+    def stop(self):
+        self._running = False
+        self.stream.stop_stream()
+        self.stream.close()
+        self.pa.terminate()
+
+# ---------------------------------------------------------------------------
+# Transcription worker
+# ---------------------------------------------------------------------------
+def transcription_worker(model, audio_queue, text_queue):
+    """Thread that transcribes audio from the queue."""
+    while True:
+        audio = audio_queue.get()
+        if audio is None:
+            break
+
+        segments, info = model.transcribe(
+            audio,
+            language='en',
+            beam_size=5,
+            vad_filter=False,  # we already run VAD ourselves
+            condition_on_previous_text=False,  # prevents repetition loops
+        )
+
+        text = ' '.join(seg.text.strip() for seg in segments).strip()
+        if text:
+            text_queue.put(text)
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 def main():
-    print(f"Loading Whisper '{MODEL_SIZE}' model on GPU...")
-    model = whisper.load_model(MODEL_SIZE, device="cuda")
+    parser = argparse.ArgumentParser(
+        description="GPU-accelerated voice dictation with faster-whisper + Silero VAD")
+    parser.add_argument('--model', default='large-v3',
+                        help='Whisper model (tiny, base, small, medium, '
+                             'large-v2, large-v3) (default: large-v3)')
+    parser.add_argument('--device', type=int, default=None,
+                        help='Audio input device index (see --list-devices)')
+    parser.add_argument('--list-devices', action='store_true',
+                        help='List available input devices and exit')
+    parser.add_argument('--push-to-talk', action='store_true',
+                        help='Hold Right Ctrl to record (default: always listening)')
+    parser.add_argument('--no-type', action='store_true',
+                        help='Print to terminal only, do not type into windows')
+    args = parser.parse_args()
+
+    if args.list_devices:
+        list_devices()
+        return
+
+    # Load faster-whisper model on GPU
+    from faster_whisper import WhisperModel
+
+    print(f"Loading faster-whisper model '{args.model}' on GPU...")
+    model = WhisperModel(args.model, device="cuda", compute_type="float16")
     print("Model loaded!")
 
-    p = pyaudio.PyAudio()
-    stream = p.open(
-        format=pyaudio.paInt16,
-        channels=1,
-        rate=SAMPLE_RATE,
-        input=True,
-        frames_per_buffer=1024
-    )
+    # Queues for threaded pipeline
+    audio_queue = queue.Queue(maxsize=2)
+    text_queue = queue.Queue()
+
+    # Start transcription thread
+    transcriber = threading.Thread(
+        target=transcription_worker, args=(model, audio_queue, text_queue), daemon=True)
+    transcriber.start()
+
+    # Start recorder
+    recorder = VoiceRecorder(device_index=args.device, push_to_talk=args.push_to_talk)
+
+    mode = "PUSH-TO-TALK (Right Ctrl)" if args.push_to_talk else "ALWAYS ON"
+    output = "TERMINAL ONLY" if args.no_type else "TYPING TO WINDOW"
 
     print("\n" + "=" * 60)
-    print("WHISPER GPU DICTATION - Click Claude Code, then speak")
+    print(f"  WHISPER GPU DICTATION")
+    print(f"  Model:  {args.model} | Mode: {mode}")
+    print(f"  Output: {output}")
+    print(f"  Engine: faster-whisper + Silero VAD")
     print("=" * 60)
-    print(f"Recording {CHUNK_DURATION}s chunks, transcribing on GPU")
-    print("Say 'send message' or 'send' to submit")
-    print("Ctrl+C to stop")
+    if not args.push_to_talk:
+        print("Speak naturally. Pauses end an utterance.")
+    else:
+        print("Hold Right Ctrl and speak. Release to end.")
+    print("Ctrl+C to stop.")
     print("=" * 60 + "\n")
 
     try:
-        while True:
-            print("Listening...", end='\r')
-            audio = record_chunk(stream, CHUNK_DURATION)
+        for audio in recorder.iter_utterances():
+            duration = len(audio) / SAMPLE_RATE
+            print(f"  [{duration:.1f}s] Transcribing...", end='\r')
 
-            if is_silent(audio):
+            # Send to transcription thread
+            audio_queue.put(audio)
+
+            # Check for results (non-blocking for previous, then block for this one)
+            try:
+                text = text_queue.get(timeout=10)
+            except queue.Empty:
+                print("  [timeout]                ")
                 continue
 
-            print("Transcribing...    ", end='\r')
-
-            # Transcribe directly from numpy array (no ffmpeg needed)
-            # Pad or trim to 30 seconds as Whisper expects
-            audio_padded = whisper.pad_or_trim(audio)
-
-            # Make log-Mel spectrogram
-            mel = whisper.log_mel_spectrogram(audio_padded, n_mels=model.dims.n_mels).to(model.device)
-
-            # Decode
-            options = whisper.DecodingOptions(language='en', fp16=True)
-            result = whisper.decode(model, mel, options)
-
-            text = result.text.strip()
-
-            # Filter out hallucinations
-            text_clean = text.lower().strip().strip('.!,')
-            hallucination_phrases = ['thank', 'watching', 'subscribe', 'bye', 'goodbye']
-            # Skip if it's mostly a hallucination phrase
-            if any(phrase in text_clean for phrase in ['for watching', 'subscribe',
-                   'see you next', 'see you in the next', 'yes sir', 'yes, sir']):
-                print(f"[skipped hallucination]")
+            # Filter
+            if is_hallucination(text):
+                print(f"  [filtered: {text[:40]}]")
                 continue
-            # Short "thanks" alone is usually hallucination
-            if text_clean in ['thanks', 'thank you', 'thanks.', 'thank you.']:
-                print(f"[skipped short thanks]")
-                continue
-            # Skip very short unclear outputs and repeated bye/thanks
-            if text_clean in ['', 'you', 'the', 'a', 'i', 'it', 'bye', 'okay', 'ok', 'yeah', 'yes', 'no']:
-                continue
-            if text_clean.replace('bye', '').replace(' ', '').replace('for', '').replace('now', '') == '':  # "bye bye bye" or "bye for now"
-                print(f"[skipped bye spam]")
-                continue
-
-            # Detect repetition loops (same phrase repeated 3+ times)
-            def has_repetition(txt):
-                words = txt.lower().split()
-                if len(words) < 6:
-                    return False
-                for pattern_len in range(2, 5):
-                    if len(words) >= pattern_len * 3:
-                        pattern = ' '.join(words[:pattern_len])
-                        if txt.lower().count(pattern) >= 3:
-                            return True
-                return False
-
             if has_repetition(text):
-                print(f"[skipped repetition loop]")
+                print(f"  [repetition skipped]")
                 continue
 
-            print(f"[heard] {text}")
+            print(f"  >>> {text}")
 
-            # Process and type
-            processed = process_commands(text)
-            if processed:
-                type_text(processed + ' ')
+            # Type or just print
+            if not args.no_type:
+                processed = process_commands(text)
+                if processed:
+                    type_text(processed + ' ')
 
     except KeyboardInterrupt:
-        print("\n\nStopped.")
+        print("\n\nStopping...")
     finally:
-        stream.stop_stream()
-        stream.close()
-        p.terminate()
+        recorder.stop()
+        audio_queue.put(None)  # signal transcription thread to exit
+        transcriber.join(timeout=5)
+        print("Done.")
 
 if __name__ == "__main__":
     main()

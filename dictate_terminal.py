@@ -1,115 +1,248 @@
 #!/usr/bin/env python3
 """
-GPU-accelerated voice dictation using OpenAI Whisper.
-Records audio in chunks and transcribes using GPU.
+GPU-accelerated voice dictation using faster-whisper + Silero VAD.
+Prints transcribed speech to the terminal (no xdotool needed).
 
-Usage: python ~/dictate_whisper.py [--model small]
-Models: tiny, base, small, medium, large (default: small)
+Usage:
+  python dictate_terminal.py                    # always-on, default mic
+  python dictate_terminal.py --model large-v3   # use specific model
+  python dictate_terminal.py --list-devices     # show available mics
+  python dictate_terminal.py --device 1         # use specific mic
+
+Ctrl+C to stop.
 """
 
-import whisper
-import pyaudio
-import numpy as np
-import tempfile
-import wave
 import argparse
 import sys
+import threading
+import queue
+import numpy as np
+import pyaudio
 
-# Audio settings
+# ---------------------------------------------------------------------------
+# Configuration defaults
+# ---------------------------------------------------------------------------
 SAMPLE_RATE = 16000
-CHANNELS = 1
-CHUNK_DURATION = 5  # seconds per chunk
-SILENCE_THRESHOLD = 500  # amplitude threshold for silence detection
+FRAME_SIZE = 512           # samples per VAD frame (32ms at 16kHz)
+MIN_SPEECH_MS = 250        # minimum speech duration to transcribe
+MAX_SPEECH_S = 15          # maximum single utterance length (seconds)
+SILENCE_AFTER_SPEECH_MS = 600  # silence duration to end an utterance
 
-def record_chunk(stream, duration):
-    """Record audio chunk and return numpy array."""
-    frames = []
-    num_frames = int(SAMPLE_RATE * duration / 1024)
+# Whisper hallucination phrases (produced on silence / noise)
+HALLUCINATIONS = {
+    '', 'you', 'the', 'a', 'i', 'it', 'bye', 'okay', 'ok', 'yeah', 'yes',
+    'no', 'thanks', 'thank you', 'thanks for watching', 'thank you for watching',
+    'like and subscribe', 'subscribe', 'see you next time', 'bye bye',
+    'see you in the next video', 'yes sir', 'so',
+}
 
-    for _ in range(num_frames):
-        data = stream.read(1024, exception_on_overflow=False)
-        frames.append(data)
+# ---------------------------------------------------------------------------
+# Filters
+# ---------------------------------------------------------------------------
+def is_hallucination(text):
+    """Return True if text looks like a Whisper hallucination."""
+    clean = text.lower().strip().strip('.!,?')
+    if clean in HALLUCINATIONS:
+        return True
+    if 'for watching' in clean or 'subscribe' in clean:
+        return True
+    if clean.replace('bye', '').replace(' ', '').replace('for', '').replace('now', '') == '':
+        return True
+    return False
 
-    audio_data = b''.join(frames)
-    return np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+def has_repetition(text):
+    """Return True if text contains a looping phrase."""
+    words = text.lower().split()
+    if len(words) < 6:
+        return False
+    for plen in range(2, 5):
+        if len(words) >= plen * 3:
+            pattern = ' '.join(words[:plen])
+            if text.lower().count(pattern) >= 3:
+                return True
+    return False
 
-def is_silent(audio_chunk, threshold=0.01):
-    """Check if audio chunk is mostly silence."""
-    return np.max(np.abs(audio_chunk)) < threshold
-
-def save_temp_wav(audio_data, filename):
-    """Save audio data to temporary WAV file."""
-    with wave.open(filename, 'wb') as wf:
-        wf.setnchannels(CHANNELS)
-        wf.setsampwidth(2)  # 16-bit
-        wf.setframerate(SAMPLE_RATE)
-        wf.writeframes((audio_data * 32768).astype(np.int16).tobytes())
-
-def main():
-    parser = argparse.ArgumentParser(description="Whisper GPU dictation")
-    parser.add_argument('--model', default='small',
-                       choices=['tiny', 'base', 'small', 'medium', 'large'],
-                       help='Whisper model size (default: small)')
-    parser.add_argument('--chunk', type=int, default=5,
-                       help='Recording chunk duration in seconds (default: 5)')
-    args = parser.parse_args()
-
-    print(f"Loading Whisper model '{args.model}' on GPU...")
-    model = whisper.load_model(args.model, device="cuda")
-    print(f"Model loaded successfully!")
-
-    # Initialize audio
+# ---------------------------------------------------------------------------
+# Audio device listing
+# ---------------------------------------------------------------------------
+def list_devices():
+    """Print available input devices."""
     p = pyaudio.PyAudio()
-    stream = p.open(
-        format=pyaudio.paInt16,
-        channels=CHANNELS,
-        rate=SAMPLE_RATE,
-        input=True,
-        frames_per_buffer=1024
-    )
+    print("\nAvailable input devices:")
+    print("-" * 50)
+    for i in range(p.get_device_count()):
+        info = p.get_device_info_by_index(i)
+        if info['maxInputChannels'] > 0:
+            default = " (DEFAULT)" if i == p.get_default_input_device_info()['index'] else ""
+            print(f"  {i}: {info['name']}{default}")
+    print()
+    p.terminate()
 
-    print("\n" + "=" * 50)
-    print(f"WHISPER DICTATION (GPU) - {args.chunk}s chunks")
-    print("Speak now (Ctrl+C to stop)")
-    print("=" * 50 + "\n")
+# ---------------------------------------------------------------------------
+# VAD-based audio recorder
+# ---------------------------------------------------------------------------
+class VoiceRecorder:
+    """Records audio and yields speech segments using Silero VAD."""
 
-    try:
-        while True:
-            # Record chunk
-            audio = record_chunk(stream, args.chunk)
+    def __init__(self, device_index=None):
+        from silero_vad import load_silero_vad
+        import torch
 
-            # Skip if silent
-            if is_silent(audio):
-                print("    [silence]", end='\r')
+        self.vad_model = load_silero_vad()
+        self.torch = torch
+        self._running = True
+
+        self.pa = pyaudio.PyAudio()
+        kwargs = dict(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=SAMPLE_RATE,
+            input=True,
+            frames_per_buffer=FRAME_SIZE,
+        )
+        if device_index is not None:
+            kwargs['input_device_index'] = device_index
+        self.stream = self.pa.open(**kwargs)
+
+    def _read_frame(self):
+        data = self.stream.read(FRAME_SIZE, exception_on_overflow=False)
+        return np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+
+    def _vad_is_speech(self, frame):
+        tensor = self.torch.from_numpy(frame)
+        confidence = self.vad_model(tensor, SAMPLE_RATE).item()
+        return confidence > 0.5
+
+    def iter_utterances(self):
+        """Yield numpy arrays of complete speech utterances."""
+        silence_frames_needed = int(SILENCE_AFTER_SPEECH_MS / (FRAME_SIZE / SAMPLE_RATE * 1000))
+        min_speech_frames = int(MIN_SPEECH_MS / (FRAME_SIZE / SAMPLE_RATE * 1000))
+        max_speech_frames = int(MAX_SPEECH_S * SAMPLE_RATE / FRAME_SIZE)
+
+        while self._running:
+            frame = self._read_frame()
+            if not self._vad_is_speech(frame):
                 continue
 
-            # Save to temp file for Whisper
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
-                temp_path = f.name
-            save_temp_wav(audio, temp_path)
+            speech_frames = [frame]
+            silence_count = 0
 
-            # Transcribe with GPU
-            result = model.transcribe(
-                temp_path,
-                language='en',
-                fp16=True,  # Use FP16 for faster GPU inference
-                task='transcribe'
-            )
+            while self._running and silence_count < silence_frames_needed:
+                frame = self._read_frame()
+                speech_frames.append(frame)
+                if self._vad_is_speech(frame):
+                    silence_count = 0
+                else:
+                    silence_count += 1
+                if len(speech_frames) >= max_speech_frames:
+                    break
 
-            text = result['text'].strip()
-            if text and text.lower() not in ['', 'you', 'thanks for watching!', 'thank you.']:
-                print(f">>> {text}")
+            if len(speech_frames) < min_speech_frames:
+                continue
 
-            # Cleanup
-            import os
-            os.unlink(temp_path)
+            audio = np.concatenate(speech_frames)
+            self.vad_model.reset_states()
+            yield audio
+
+    def stop(self):
+        self._running = False
+        self.stream.stop_stream()
+        self.stream.close()
+        self.pa.terminate()
+
+# ---------------------------------------------------------------------------
+# Transcription worker
+# ---------------------------------------------------------------------------
+def transcription_worker(model, audio_queue, text_queue):
+    """Thread that transcribes audio from the queue."""
+    while True:
+        audio = audio_queue.get()
+        if audio is None:
+            break
+
+        segments, info = model.transcribe(
+            audio,
+            language='en',
+            beam_size=5,
+            vad_filter=False,
+            condition_on_previous_text=False,
+        )
+
+        text = ' '.join(seg.text.strip() for seg in segments).strip()
+        if text:
+            text_queue.put(text)
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(
+        description="GPU-accelerated voice dictation (terminal output)")
+    parser.add_argument('--model', default='large-v3',
+                        help='Whisper model (default: large-v3)')
+    parser.add_argument('--device', type=int, default=None,
+                        help='Audio input device index (see --list-devices)')
+    parser.add_argument('--list-devices', action='store_true',
+                        help='List available input devices and exit')
+    args = parser.parse_args()
+
+    if args.list_devices:
+        list_devices()
+        return
+
+    from faster_whisper import WhisperModel
+
+    print(f"Loading faster-whisper model '{args.model}' on GPU...")
+    model = WhisperModel(args.model, device="cuda", compute_type="float16")
+    print("Model loaded!")
+
+    audio_queue = queue.Queue(maxsize=2)
+    text_queue = queue.Queue()
+
+    transcriber = threading.Thread(
+        target=transcription_worker, args=(model, audio_queue, text_queue), daemon=True)
+    transcriber.start()
+
+    recorder = VoiceRecorder(device_index=args.device)
+
+    print("\n" + "=" * 60)
+    print(f"  WHISPER GPU DICTATION (terminal)")
+    print(f"  Model:  {args.model}")
+    print(f"  Engine: faster-whisper + Silero VAD")
+    print("=" * 60)
+    print("Speak naturally. Pauses end an utterance.")
+    print("Ctrl+C to stop.")
+    print("=" * 60 + "\n")
+
+    try:
+        for audio in recorder.iter_utterances():
+            duration = len(audio) / SAMPLE_RATE
+            print(f"  [{duration:.1f}s] Transcribing...", end='\r')
+
+            audio_queue.put(audio)
+
+            try:
+                text = text_queue.get(timeout=10)
+            except queue.Empty:
+                print("  [timeout]                ")
+                continue
+
+            if is_hallucination(text):
+                print(f"  [filtered: {text[:40]}]")
+                continue
+            if has_repetition(text):
+                print(f"  [repetition skipped]")
+                continue
+
+            print(f"  >>> {text}")
 
     except KeyboardInterrupt:
-        print("\n\nStopped.")
+        print("\n\nStopping...")
     finally:
-        stream.stop_stream()
-        stream.close()
-        p.terminate()
+        recorder.stop()
+        audio_queue.put(None)
+        transcriber.join(timeout=5)
+        print("Done.")
 
 if __name__ == "__main__":
     main()
