@@ -66,13 +66,14 @@ class HandsFreeDictation:
             trailing_silence_ms=1200,
         )
 
-        # Local transcriber
+        # Local transcriber (load model eagerly so first utterance isn't slow)
         print(f"Loading faster-whisper {model_size}...")
         self.transcriber = create_local_transcriber(
             model_size=model_size,
             language=language,
             sample_rate=self.config.audio.sample_rate,
         )
+        self.transcriber._load_model()
 
         # Text output
         self.output = TextOutput(
