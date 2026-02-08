@@ -102,6 +102,23 @@ device_name: Optional[str] = "Your Mic Name"
 
 Run with `--test-vad` to verify your mic is detected and VAD is working before doing full dictation.
 
+## Troubleshooting
+
+**VAD stuck in "speaking" / never transcribes:**
+The VAD calibrates to ambient noise for 1 second at startup. If you speak or make noise during calibration, the threshold will be set too high and real speech won't trigger transcription. Restart the program and stay quiet during the "Calibrating..." phase. Environments with variable background noise (fans cycling, treadmills) are handled well by the calibration, but the noise must be present during the calibration window.
+
+**"No speech detected" on every utterance:**
+Usually means the wrong microphone is selected. Run `./dictate-handsfree.sh --list-devices` to see available mics, then either pass `--device "Your Mic Name"` or edit the `DEFAULT_DEVICE` line in `dictate-handsfree.sh`. The system default mic (often a laptop mic) has a much higher noise floor than a USB condenser mic, which can make the VAD unusable.
+
+**Long pause before first transcription result:**
+The whisper model is loaded eagerly at startup. If you still see a delay, check that you have GPU acceleration working -- CPU inference is significantly slower. Run `python -c "import torch; print(torch.cuda.is_available())"` to verify CUDA is available.
+
+**"Audio status: input overflow" messages:**
+This means audio chunks are arriving faster than they're being processed, usually during transcription. Occasional overflow messages are harmless -- the VAD will recover. Frequent overflow suggests the system is under heavy load. Using a smaller model (`-m tiny`) or closing GPU-intensive applications can help.
+
+**Terminal hotkeys not working (copy, paste, undo):**
+The voice commands use `ctrl+shift+c/v/x/z` for terminal compatibility. These work in most Linux terminal emulators (gnome-terminal, kitty, alacritty, etc.) but not in GUI applications where `ctrl+c/v` is standard. If you primarily dictate into GUI apps, edit the keybindings in `voice_commands.py`.
+
 ## License
 
 MIT
