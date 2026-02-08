@@ -51,7 +51,7 @@ class VoiceCommand:
 
 # Wake word required before commands (set to None to disable)
 # This prevents accidental command triggers
-WAKE_WORD = "computer"
+WAKE_WORD = "kimmy"
 
 # Command patterns - order matters (longer/more specific first)
 # These will only trigger if preceded by the wake word (if set)
@@ -262,8 +262,8 @@ class CommandExecutor:
             return True
 
         elif action == CommandAction.DELETE_WORD:
-            # Delete last word
-            self.text_output.press_key("ctrl+BackSpace")
+            # Delete last word (ctrl+w is "delete word back" in terminal/readline)
+            self.text_output.press_key("ctrl+w")
             print(" [DELETE WORD]")
             return True
 
@@ -293,34 +293,34 @@ class CommandExecutor:
             print(" [TAB]")
             return True
 
-        # Editing
+        # Editing (ctrl+shift for terminal compatibility)
         elif action == CommandAction.UNDO:
-            self.text_output.press_key("ctrl+z")
+            self.text_output.press_key("ctrl+shift+z")
             print(" [UNDO]")
             return True
 
         elif action == CommandAction.REDO:
-            self.text_output.press_key("ctrl+shift+z")
+            self.text_output.press_key("ctrl+shift+y")
             print(" [REDO]")
             return True
 
         elif action == CommandAction.SELECT_ALL:
-            self.text_output.press_key("ctrl+a")
+            self.text_output.press_key("ctrl+shift+a")
             print(" [SELECT ALL]")
             return True
 
         elif action == CommandAction.COPY:
-            self.text_output.press_key("ctrl+c")
+            self.text_output.press_key("ctrl+shift+c")
             print(" [COPY]")
             return True
 
         elif action == CommandAction.PASTE:
-            self.text_output.press_key("ctrl+v")
+            self.text_output.press_key("ctrl+shift+v")
             print(" [PASTE]")
             return True
 
         elif action == CommandAction.CUT:
-            self.text_output.press_key("ctrl+x")
+            self.text_output.press_key("ctrl+shift+x")
             print(" [CUT]")
             return True
 

@@ -45,15 +45,17 @@ class HandsFreeDictation:
         enable_commands: bool = True,
         fix_homonyms: bool = False,
         homonym_llm: bool = True,
+        device_name: Optional[str] = None,
     ):
         self.config = get_config()
 
-        # Audio capture
+        # Audio capture (CLI --device overrides config)
+        mic_device = device_name or self.config.audio.device_name
         self.audio = AudioCapture(
             sample_rate=self.config.audio.sample_rate,
             channels=self.config.audio.channels,
             chunk_duration_ms=self.config.audio.chunk_duration_ms,
-            device_name=self.config.audio.device_name,
+            device_name=mic_device,
         )
 
         # Voice activity detection
@@ -323,8 +325,26 @@ def main():
         action="store_true",
         help="Use rule-based homonym fixer instead of LLM (faster but less accurate)"
     )
+    parser.add_argument(
+        "--device", "-d",
+        default=None,
+        help="Microphone device name pattern (e.g. 'RØDE NT-USB+', 'Blue Yeti')"
+    )
+    parser.add_argument(
+        "--list-devices",
+        action="store_true",
+        help="List available audio input devices and exit"
+    )
 
     args = parser.parse_args()
+
+    if args.list_devices:
+        from audio_capture import AudioCapture
+        ac = AudioCapture()
+        print("Available input devices:")
+        for dev in ac.list_devices():
+            print(f"  [{dev['index']}] {dev['name']} ({dev['sample_rate']}Hz, {dev['channels']}ch)")
+        return
 
     if args.test_vad:
         from vad import test_vad
@@ -346,6 +366,7 @@ def main():
         enable_commands=not args.no_commands,
         fix_homonyms=args.fix_homonyms,
         homonym_llm=not args.homonym_rules,
+        device_name=args.device,
     )
 
     asyncio.run(app.run())
