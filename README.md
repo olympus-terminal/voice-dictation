@@ -9,7 +9,7 @@ Uses [faster-whisper](https://github.com/SYSTRAN/faster-whisper) for on-device t
 - **Hands-free operation** -- no hotkeys needed, VAD detects speech automatically
 - **Local transcription** -- runs entirely on your machine via faster-whisper (CUDA GPU or CPU)
 - **Auto-calibrating VAD** -- calibrates to your ambient noise level at startup
-- **Voice commands** -- say "computer new line", "computer delete that", etc.
+- **Voice commands** -- say "kimmy new line", "kimmy delete that", etc.
 - **System tray indicator** -- shows recording/processing status
 - **Multiple output modes** -- type into focused window (xdotool), clipboard, or both
 - **Homonym correction** -- optional context-aware fixing of their/there/they're, etc.
@@ -45,6 +45,12 @@ On first run, the whisper model will be downloaded (~150 MB for base). Stay quie
 # Better accuracy with small model
 ./dictate-handsfree.sh -m small
 
+# Specify microphone by name
+./dictate-handsfree.sh -d "Blue Yeti"
+
+# List available microphones
+./dictate-handsfree.sh --list-devices
+
 # Output to clipboard instead of typing
 ./dictate-handsfree.sh -c
 
@@ -60,17 +66,57 @@ On first run, the whisper model will be downloaded (~150 MB for base). Stay quie
 
 ## Voice Commands
 
-Say "computer" followed by a command:
+Say **"kimmy"** followed by a command. The wake word prevents accidental triggers during normal dictation. You can change it by editing `WAKE_WORD` in `voice_commands.py`.
+
+### Deletion
 
 | Command | Action |
 |---|---|
-| computer new line | Press Enter |
-| computer new paragraph | Press Enter twice |
-| computer tab | Press Tab |
-| computer delete that | Delete last utterance |
-| computer stop listening | Stop dictation |
-| computer pause | Pause dictation |
-| computer caps on/off | Toggle caps lock mode |
+| kimmy delete all | Select all + delete |
+| kimmy delete everything | Select all + delete |
+| kimmy clear all | Select all + delete |
+| kimmy erase all | Select all + delete |
+| kimmy delete that | Delete current line |
+| kimmy delete line | Delete current line |
+| kimmy scratch that | Delete current line |
+| kimmy delete word | Delete last word (ctrl+w) |
+| kimmy undo | Undo (ctrl+shift+z) |
+| kimmy undo that | Undo (ctrl+shift+z) |
+| kimmy redo | Redo (ctrl+shift+y) |
+
+### Navigation
+
+| Command | Action |
+|---|---|
+| kimmy new line | Newline |
+| kimmy next line | Newline |
+| kimmy new paragraph | Double newline |
+| kimmy press enter | Enter key |
+| kimmy press tab | Tab key |
+
+### Editing
+
+| Command | Action |
+|---|---|
+| kimmy select all | Select all (ctrl+shift+a) |
+| kimmy copy that | Copy (ctrl+shift+c) |
+| kimmy paste | Paste (ctrl+shift+v) |
+| kimmy cut that | Cut (ctrl+shift+x) |
+| kimmy save file | Save (ctrl+s) |
+| kimmy escape | Escape key |
+| kimmy send message | Press Enter |
+| kimmy send it | Press Enter |
+
+### Mode Control
+
+| Command | Action |
+|---|---|
+| kimmy stop listening | Stop dictation |
+| kimmy pause listening | Pause dictation |
+| kimmy caps on | ALL CAPS mode on |
+| kimmy caps off | ALL CAPS mode off |
+
+Commands can be mixed with text in the same utterance -- e.g. "kimmy scratch that I meant something else" will delete the line then type "I meant something else."
 
 Disable voice commands with `--no-commands` for pure dictation.
 
