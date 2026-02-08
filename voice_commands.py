@@ -53,6 +53,12 @@ class VoiceCommand:
 # This prevents accidental command triggers
 WAKE_WORD = "kimmy"
 
+# Common misrecognitions of the wake word by whisper
+# These are matched as alternatives so "Kimi send" works the same as "kimmy send"
+WAKE_WORD_VARIANTS = [
+    "kimmy", "kimi", "kimmi", "give me", "jimmy", "gimme", "timmy",
+]
+
 # Command patterns - order matters (longer/more specific first)
 # These will only trigger if preceded by the wake word (if set)
 COMMAND_PATTERNS: Dict[str, CommandAction] = {
@@ -71,7 +77,10 @@ COMMAND_PATTERNS: Dict[str, CommandAction] = {
     # Navigation/Actions
     r"send message": CommandAction.SEND,
     r"send it": CommandAction.SEND,
+    r"send": CommandAction.SEND,
+    r"sent": CommandAction.SEND,
     r"press enter": CommandAction.ENTER,
+    r"enter": CommandAction.ENTER,
     r"new line": CommandAction.NEW_LINE,
     r"next line": CommandAction.NEW_LINE,
     r"new paragraph": CommandAction.NEW_PARAGRAPH,
@@ -113,12 +122,21 @@ class VoiceCommandProcessor:
     def __init__(self, wake_word: Optional[str] = WAKE_WORD):
         self.wake_word = wake_word.lower() if wake_word else None
 
+        # Build wake word regex that matches all known variants
+        if self.wake_word:
+            variants = [re.escape(v) for v in WAKE_WORD_VARIANTS]
+            if self.wake_word not in [v.lower() for v in WAKE_WORD_VARIANTS]:
+                variants.insert(0, re.escape(self.wake_word))
+            wake_regex = '(?:' + '|'.join(variants) + ')'
+        else:
+            wake_regex = None
+
         # Compile command patterns
         self._patterns: list[Tuple[re.Pattern, CommandAction]] = []
         for pattern, action in COMMAND_PATTERNS.items():
-            if self.wake_word:
-                # Require wake word before command
-                full_pattern = self.wake_word + r'\s+' + pattern
+            if wake_regex:
+                # Require wake word (or variant) before command
+                full_pattern = wake_regex + r'\s+' + pattern
             else:
                 full_pattern = pattern
             regex = re.compile(r'\b' + full_pattern + r'\b', re.IGNORECASE)
