@@ -236,7 +236,7 @@ class HandsFreeDictation:
         print("  Hands-Free Dictation")
         print("  Speak naturally - text appears where you type")
         if self.enable_commands:
-            print("  Voice commands: ON (say 'computer <command>')")
+            print("  Voice commands: ON (say 'kimmy <command>')")
         else:
             print("  Voice commands: OFF (pure dictation)")
         if self.fix_homonyms:
@@ -307,9 +307,9 @@ def main():
         help="Disable system tray icon"
     )
     parser.add_argument(
-        "--no-commands",
+        "--commands",
         action="store_true",
-        help="Disable voice commands (pure dictation only)"
+        help="Enable voice commands (experimental, say 'kimmy <command>')"
     )
     parser.add_argument(
         "--test-vad",
@@ -364,7 +364,7 @@ def main():
         output_mode=output_mode,
         model_size=args.model,
         use_tray=not args.no_tray,
-        enable_commands=not args.no_commands,
+        enable_commands=args.commands,
         fix_homonyms=args.fix_homonyms,
         homonym_llm=not args.homonym_rules,
         device_name=args.device,
