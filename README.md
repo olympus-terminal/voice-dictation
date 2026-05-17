@@ -1,169 +1,182 @@
-# Hands-Free Voice Dictation
+# Voice-to-Text GPU
 
-Local, GPU-accelerated voice dictation for Linux. Speak naturally and text appears wherever your cursor is. No cloud APIs required.
-
-Uses [faster-whisper](https://github.com/SYSTRAN/faster-whisper) for on-device transcription with automatic voice activity detection (VAD) -- just talk and it types.
+GPU-accelerated real-time voice dictation using [faster-whisper](https://github.com/SYSTRAN/faster-whisper) and [Silero VAD](https://github.com/snakers4/silero-vad).
 
 ## Features
 
-- **Hands-free operation** -- no hotkeys needed, VAD detects speech automatically
-- **Local transcription** -- runs entirely on your machine via faster-whisper (CUDA GPU or CPU)
-- **Auto-calibrating VAD** -- calibrates to your ambient noise level at startup
-- **Voice commands** -- say "kimmy new line", "kimmy delete that", etc.
-- **System tray indicator** -- shows recording/processing status
-- **Multiple output modes** -- type into focused window (xdotool), clipboard, or both
-- **Homonym correction** -- optional context-aware fixing of their/there/they're, etc.
+- **faster-whisper** (CTranslate2 backend) -- ~4x faster than openai-whisper, lower VRAM
+- **Silero VAD** -- neural voice activity detection eliminates hallucinations on silence
+- **Threaded pipeline** -- records audio while previous utterance is being transcribed
+- **Push-to-talk** -- optional hold-to-record mode (Right Ctrl)
+- **Window typing** -- types directly into any focused window via xdotool
+- **Voice commands** -- punctuation and actions via spoken phrases
+- **Microphone selection** -- choose input device from the command line
+- Hallucination filtering and repetition loop detection
 
 ## Requirements
 
-- Linux (X11 -- uses xdotool for typing)
-- Python 3.10+
-- NVIDIA GPU recommended (works on CPU but slower)
-- `xdotool` and `xclip` system packages
+- NVIDIA GPU with CUDA support
+- Python 3.8+
+- ffmpeg
+- xdotool (for window typing mode)
+- PulseAudio or PipeWire
 
-## Quick Start
+## Installation
 
 ```bash
-# System dependencies
-sudo apt install xdotool xclip portaudio19-dev
+# Create conda environment
+conda create -n dictation python=3.11
+conda activate dictation
 
-# Python dependencies
-pip install -r requirements.txt
+# Install PyTorch with CUDA
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-# Run hands-free dictation
-./dictate-handsfree.sh
+# Install dependencies
+pip install faster-whisper silero-vad pyaudio numpy pynput
+
+# System dependencies (Ubuntu/Debian)
+sudo apt install ffmpeg xdotool portaudio19-dev
 ```
-
-On first run, the whisper model will be downloaded (~150 MB for base). Stay quiet for 1 second while VAD calibrates to your room noise, then start talking.
 
 ## Usage
 
+### Terminal Mode
+
+Prints transcribed text to the terminal (no xdotool needed):
+
 ```bash
-# Default (base model, type into focused window)
-./dictate-handsfree.sh
-
-# Better accuracy with small model
-./dictate-handsfree.sh -m small
-
-# Specify microphone by name
-./dictate-handsfree.sh -d "Blue Yeti"
-
-# List available microphones
-./dictate-handsfree.sh --list-devices
-
-# Output to clipboard instead of typing
-./dictate-handsfree.sh -c
-
-# Both typing and clipboard
-./dictate-handsfree.sh -b
-
-# Test voice activity detection only (no transcription)
-./dictate-handsfree.sh --test-vad
-
-# Push-to-talk / toggle mode (alternative to hands-free)
-./run.sh --local
+python dictate_terminal.py
+python dictate_terminal.py --model small         # faster, less accurate
+python dictate_terminal.py --list-devices        # show microphones
+python dictate_terminal.py --device 1            # pick a mic
 ```
+
+### Window Typing Mode
+
+Types directly into the focused window:
+
+```bash
+python dictate_to_window.py
+python dictate_to_window.py --push-to-talk       # hold Right Ctrl to record
+python dictate_to_window.py --model large-v3     # most accurate (default)
+python dictate_to_window.py --no-type            # print only, don't type
+python dictate_to_window.py --list-devices
+python dictate_to_window.py --device 1
+```
+
+1. Run the script in a terminal
+2. Click on the window you want to type into
+3. Speak naturally -- pauses end an utterance
+4. Text appears in the focused window
+
+### Push-to-Talk
+
+```bash
+python dictate_to_window.py --push-to-talk
+```
+
+Hold **Right Ctrl** to record. Release to stop. Only speech recorded while the key is held will be transcribed.
 
 ## Voice Commands
 
-Say **"kimmy"** followed by a command. The wake word prevents accidental triggers during normal dictation. You can change it by editing `WAKE_WORD` in `voice_commands.py`.
-
-### Deletion
+Punctuation requires the `insert` prefix so normal speech isn't mangled:
 
 | Command | Action |
-|---|---|
-| kimmy delete all | Select all + delete |
-| kimmy delete everything | Select all + delete |
-| kimmy clear all | Select all + delete |
-| kimmy erase all | Select all + delete |
-| kimmy delete that | Delete current line |
-| kimmy delete line | Delete current line |
-| kimmy scratch that | Delete current line |
-| kimmy delete word | Delete last word (ctrl+w) |
-| kimmy undo | Undo (ctrl+shift+z) |
-| kimmy undo that | Undo (ctrl+shift+z) |
-| kimmy redo | Redo (ctrl+shift+y) |
+|---------|--------|
+| `send message` / `send it` / `press enter` | Press Enter |
+| `new line` | Insert newline |
+| `insert period` | `.` |
+| `insert comma` | `,` |
+| `insert question mark` | `?` |
+| `insert exclamation` | `!` |
+| `insert colon` | `:` |
+| `insert semicolon` | `;` |
+| `delete that` / `delete word` | Delete previous word |
 
-### Navigation
+## Models
 
-| Command | Action |
-|---|---|
-| kimmy new line | Newline |
-| kimmy next line | Newline |
-| kimmy new paragraph | Double newline |
-| kimmy press enter | Enter key |
-| kimmy press tab | Tab key |
+faster-whisper uses CTranslate2-converted models. Available sizes:
 
-### Editing
+| Model | VRAM | Speed | Accuracy | Notes |
+|-------|------|-------|----------|-------|
+| `tiny` | ~1 GB | Fastest | Basic | Good for testing |
+| `base` | ~1 GB | Very fast | Fair | |
+| `small` | ~2 GB | Fast | Good | Decent for most uses |
+| `medium` | ~4 GB | Medium | Very good | |
+| `large-v2` | ~5 GB | Slower | Excellent | |
+| `large-v3` | ~5 GB | Slower | Best | Default, recommended |
 
-| Command | Action |
-|---|---|
-| kimmy select all | Select all (ctrl+shift+a) |
-| kimmy copy that | Copy (ctrl+shift+c) |
-| kimmy paste | Paste (ctrl+shift+v) |
-| kimmy cut that | Cut (ctrl+shift+x) |
-| kimmy save file | Save (ctrl+s) |
-| kimmy escape | Escape key |
-| kimmy send message | Press Enter |
-| kimmy send it | Press Enter |
-
-### Mode Control
-
-| Command | Action |
-|---|---|
-| kimmy stop listening | Stop dictation |
-| kimmy pause listening | Pause dictation |
-| kimmy caps on | ALL CAPS mode on |
-| kimmy caps off | ALL CAPS mode off |
-
-Commands can be mixed with text in the same utterance -- e.g. "kimmy scratch that I meant something else" will delete the line then type "I meant something else."
-
-Disable voice commands with `--no-commands` for pure dictation.
+All models are downloaded automatically on first use from Hugging Face.
 
 ## Architecture
 
-| Module | Purpose |
-|---|---|
-| `hands_free.py` | Main entry point for hands-free mode |
-| `dictate.py` | Push-to-talk / toggle mode entry point |
-| `vad.py` | Voice activity detection with auto-calibration |
-| `audio_capture.py` | Microphone input via sounddevice with auto-resampling |
-| `transcriber_local.py` | Local transcription via faster-whisper |
-| `transcriber.py` | Voxtral API transcription (optional cloud mode) |
-| `text_output.py` | Text output via xdotool / xclip |
-| `voice_commands.py` | Voice command parsing and execution |
-| `homonym_fixer.py` | Context-aware homonym correction |
-| `tray_icon.py` | System tray status indicator |
-| `config.py` | Configuration defaults |
-
-## Configuration
-
-Edit `config.py` to set your microphone device name, sample rate, hotkeys, etc. The defaults work for most USB microphones.
-
-To use a specific mic, set `device_name` in `AudioConfig`:
-
-```python
-device_name: Optional[str] = "Your Mic Name"
+```
+Microphone
+    |
+    v
+[Silero VAD] -- detects speech start/end
+    |
+    v
+[Audio Buffer] -- accumulates frames until pause detected
+    |
+    v
+[Queue] -------> [Transcription Thread]
+                       |
+                       v
+                  [faster-whisper GPU]
+                       |
+                       v
+                  [Hallucination Filter]
+                       |
+                       v
+                  [Voice Commands]
+                       |
+                       v
+                  [xdotool] --> Focused Window
 ```
 
-Run with `--test-vad` to verify your mic is detected and VAD is working before doing full dictation.
+The threaded pipeline means recording continues while the previous utterance is being transcribed, so you never miss speech.
 
 ## Troubleshooting
 
-**VAD stuck in "speaking" / never transcribes:**
-The VAD calibrates to ambient noise for 1 second at startup. If you speak or make noise during calibration, the threshold will be set too high and real speech won't trigger transcription. Restart the program and stay quiet during the "Calibrating..." phase. Environments with variable background noise (fans cycling, treadmills) are handled well by the calibration, but the noise must be present during the calibration window.
+### Hallucinations ("Thanks for watching", etc.)
 
-**"No speech detected" on every utterance:**
-Usually means the wrong microphone is selected. Run `./dictate-handsfree.sh --list-devices` to see available mics, then either pass `--device "Your Mic Name"` or edit the `DEFAULT_DEVICE` line in `dictate-handsfree.sh`. The system default mic (often a laptop mic) has a much higher noise floor than a USB condenser mic, which can make the VAD unusable.
+With Silero VAD this should be rare. If it still happens:
+- Use a better microphone (wired > Bluetooth)
+- Bluetooth mics use lossy compression that confuses Whisper
+- The hallucination filter catches common phrases automatically
 
-**Long pause before first transcription result:**
-The whisper model is loaded eagerly at startup. If you still see a delay, check that you have GPU acceleration working -- CPU inference is significantly slower. Run `python -c "import torch; print(torch.cuda.is_available())"` to verify CUDA is available.
+### Repetition loops
 
-**"Audio status: input overflow" messages:**
-This means audio chunks are arriving faster than they're being processed, usually during transcription. Occasional overflow messages are harmless -- the VAD will recover. Frequent overflow suggests the system is under heavy load. Using a smaller model (`-m tiny`) or closing GPU-intensive applications can help.
+Set automatically by `condition_on_previous_text=False` in faster-whisper. The post-processing filter also catches remaining loops.
 
-**Terminal hotkeys not working (copy, paste, undo):**
-The voice commands use `ctrl+shift+c/v/x/z` for terminal compatibility. These work in most Linux terminal emulators (gnome-terminal, kitty, alacritty, etc.) but not in GUI applications where `ctrl+c/v` is standard. If you primarily dictate into GUI apps, edit the keybindings in `voice_commands.py`.
+### X server crash / display manager restart
+
+If `dictate_to_window.py` causes X issues:
+- The script uses `--clearmodifiers` and a 12ms delay to be safer
+- Consider using `--push-to-talk` mode to control when typing happens
+- On Wayland, xdotool won't work; use ydotool instead
+
+### JACK warnings
+
+```
+Cannot connect to server socket err = No such file or directory
+jack server is not running or cannot be started
+```
+
+Harmless -- PyAudio prints these when JACK isn't installed. They can be safely ignored.
+
+### Choosing a microphone
+
+```bash
+python dictate_to_window.py --list-devices
+```
+
+Then pass the device number:
+
+```bash
+python dictate_to_window.py --device 3
+```
 
 ## License
 
