@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/banner.png" alt="voice-dictation banner" width="100%">
+</p>
+
 # Voice-to-Text GPU
 
 GPU-accelerated real-time voice dictation using [faster-whisper](https://github.com/SYSTRAN/faster-whisper) and [Silero VAD](https://github.com/snakers4/silero-vad).
